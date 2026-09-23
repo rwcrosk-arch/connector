@@ -1,0 +1,9 @@
+name: connector
+version: 0.2.0
+description: "Live-session connector v0.2.0: crew links (standing) + consult links (TTL/idle auto-close) between gateway sessions; labeled relay via sanctioned inject_message (direct HTTP for local api_server sessions). Tools: connector_send (multi-link targeting), connector_links, connector_sessions, connector_consult. Admin CLI: hermes connector (link --kind crew|consult --ttl --idle / list / pause / resume / unlink / sweep). Loop caps persist across gateway restarts. Audit: ~/.hermes/connector/log.jsonl. Admin deck: connector-deck (status/usage/tail/serve/smoke)."
+author: "Ross + Succubus-chan"
+provides_tools:
+  - connector_send
+  - connector_links
+  - connector_sessions
+  - connector_consult

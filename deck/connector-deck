@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""connector-deck — admin console for the Hermes live-session connector.
+
+Subcommands:
+  status              links + recent hop counts
+  tail                live tail of the audit log (the message flow)
+  pause <linkId>      pause a link (fail-closed for the connector)
+  resume <linkId>     resume a paused link
+  kill <linkId>       kill a link (paused + flagged; unlink via hermes connector)
+  serve [--port N]    loopback web view: live flow + character speech-bubble
+                      stage (agents with animated bubbles per hop) + usage
+                      evaluation stats
+  smoke               post-update health check (read-only, exit 0/1)
+
+stdlib only. Reads ~/.hermes/connector/{log.jsonl,links.json,control.json};
+writes only control.json. Binds 127.0.0.1 only.
+
+FUTURE (annotated per Ross's spec, do not build yet): a native Linux GUI app
+with a system-tray icon + popup notifications when the connector is in use,
+and a window mode showing each connector instance with agent labels
+(Profile + session ID), animated characters and speech bubbles flowing per
+message. The web deck's character stage (this file) is the design prototype
+for that GUI: same event model, same label scheme.
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path(os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes")))
+CONN = HOME / "connector"
+LOG = CONN / "log.jsonl"
+LINKS = CONN / "links.json"
+CONTROL = CONN / "control.json"
+TOKEN_FILE = CONN / "deck.token"
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def load_links():
+    return read_json(LINKS, {"links": []}).get("links", [])
+
+
+def control():
+    c = read_json(CONTROL, {"paused_links": [], "killed_links": []})
+    c.setdefault("paused_links", [])
+    c.setdefault("killed_links", [])
+    return c
+
+
+def read_log_tail(n=200):
+    if not LOG.exists():
+        return []
+    lines = LOG.read_text(errors="replace").splitlines()
+    out = []
+    for l in lines[-n:]:
+        if l.strip():
+            try:
+                out.append(json.loads(l))
+            except Exception:
+                pass
+    return out
+
+
+def fmt_event(e):
+    ts = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+    if e.get("kind") == "admin":
+        return f"{ts}  ADMIN  {e.get('action')} {e.get('link_id','')} {e.get('detail','')}"
+    d = e.get("dir", "?")
+    frm = e.get("from_key", e.get("from_title", "?")).split(":")[-1]
+    to = e.get("to_key", "?").split(":")[-1]
+    acc = "OK " if e.get("accepted") else ("REF" if e.get("kind") == "hop" else "?")
+    reason = f" ({e['reason']})" if e.get("reason") else ""
+    hops = f" hop{e.get('hops_in_exchange', '?')}" if e.get("kind") == "hop" else ""
+    kind = f" [{e.get('link_kind','?')}]" if e.get("link_kind") else ""
+    return f"{ts}  {d:3s} {frm} -> {to}{hops}{kind}  [{acc}]{reason}  {e.get('text_preview', '')[:90]}"
+
+
+# ---- CLI subcommands ----
+
+def cmd_status(_):
+    c = control()
+    links = load_links()
+    print(f"{'id':22s} {'state':8s} {'kind':7s} {'control':8s} label")
+    for l in links:
+        ctl = "killed" if l["id"] in c["killed_links"] else ("paused" if l["id"] in c["paused_links"] else "-")
+        print(f"{l['id']:22s} {l['state']:8s} {l.get('kind','crew'):7s} {ctl:8s} {l['label']}")
+    if not links:
+        print("(no links — create with: hermes connector link <keyA> <keyB>)")
+    try:
+        log_lines = read_log_tail(10)
+        print(f"\nlast {len(log_lines)} events:")
+        for e in log_lines:
+            print("  " + fmt_event(e))
+    except Exception:
+        pass
+
+
+def cmd_tail(args):
+    import subprocess
+    if not LOG.exists():
+        print("no audit log yet — no hops have flowed")
+        return
+    print("tailing", LOG, "(ctrl-c to stop)")
+    subprocess.run(["tail", "-n", str(args.lines), "-f", str(LOG)])
+
+
+def _edit_control(link_id, key, add):
+    c = control()
+    lst = c[key]
+    if add and link_id not in lst:
+        lst.append(link_id)
+    if not add and link_id in lst:
+        lst.remove(link_id)
+    tmp = CONTROL.with_suffix(".tmp")
+    tmp.write_text(json.dumps(c, indent=1))
+    os.replace(tmp, CONTROL)
+    print(f"{key}: {link_id} {'added' if add else 'removed'}")
+
+
+def cmd_pause(args):
+    _edit_control(args.link_id, "paused_links", True)
+
+
+def cmd_resume(args):
+    _edit_control(args.link_id, "paused_links", False)
+
+
+def cmd_kill(args):
+    _edit_control(args.link_id, "paused_links", True)
+    _edit_control(args.link_id, "killed_links", True)
+    print("killed. also unlink with: hermes connector unlink", args.link_id)
+
+
+# ---- usage evaluation (the human's "how is this being used" view) ----
+
+def usage_stats(events=None, hours=24):
+    """Aggregate the audit log for human evaluation of connector usage."""
+    events = events if events is not None else read_log_tail(5000)
+    cutoff = time.time() - hours * 3600
+    hops = [e for e in events if e.get("kind") == "hop" and e.get("ts", 0) >= cutoff]
+    refused = [e for e in hops if not e.get("accepted")]
+    by_link = {}
+    for e in hops:
+        lid = e.get("link_id") or "unknown"
+        d = by_link.setdefault(lid, {"hops": 0, "refused": 0, "chars": 0,
+                                     "sessions": set(), "kinds": "crew"})
+        if e.get("accepted"):
+            d["hops"] += 1
+            d["chars"] += len(e.get("text_preview") or "")
+            d["sessions"].add(e.get("from_key", "?").split(":")[-1])
+        else:
+            d["refused"] += 1
+        k = e.get("link_kind")
+        if k:
+            d["kinds"] = k
+    return {
+        "window_hours": hours,
+        "total_hops": len(hops),
+        "accepted_hops": len(hops) - len(refused),
+        "refused_hops": len(refused),
+        "by_link": {k: {"hops": v["hops"], "refused": v["refused"],
+                        "chars_relayed": v["chars"],
+                        "kind": v.get("kinds", "crew"),
+                        "sessions": sorted(v["sessions"])}
+                    for k, v in by_link.items()},
+    }
+
+
+def cmd_usage(args):
+    s = usage_stats(hours=args.hours)
+    print(f"connector usage, last {args.hours}h:")
+    print(f"  accepted hops: {s['accepted_hops']}   refused: {s['refused_hops']}")
+    if not s["by_link"]:
+        print("  (no traffic)")
+        return
+    print(f"  {'link':22s} {'kind':8s} {'hops':>5s} {'ref':>4s} {'chars':>6s}  sessions")
+    for lid, d in sorted(s["by_link"].items(), key=lambda kv: -kv[1]["hops"]):
+        print(f"  {lid:22s} {d['kind']:8s} {d['hops']:5d} {d['refused']:4d} {d['chars_relayed']:6d}  {', '.join(d['sessions'][:4])}")
+
+
+# ---- smoke (Phase 2.4) ----
+
+def cmd_smoke(_):
+    checks = []
+    ok_all = True
+
+    def run(name, fn):
+        nonlocal ok_all
+        try:
+            ok, detail = fn()
+        except Exception as e:
+            ok, detail = False, f"error: {e}"
+        print(f"  {'✓' if ok else '✗'} {name}: {detail}")
+        if not ok:
+            ok_all = False
+
+    def db_schema():
+        import sqlite3
+        db = HOME / "state.db"
+        if not db.exists():
+            return False, "state.db missing"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+            need = {"session_key", "source", "profile_name", "title", "last_activity_at"}
+            missing = need - cols
+            if missing:
+                return False, f"columns missing: {sorted(missing)} — update SESSION_QUERY in the plugin"
+            con.execute("SELECT session_key FROM sessions WHERE session_key IS NOT NULL LIMIT 1")
+            return True, "schema matches"
+        finally:
+            con.close()
+
+    def perm():
+        text = (HOME / "config.yaml").read_text(errors="replace") if (HOME / "config.yaml").exists() else ""
+        return ("allow_gateway_injection" in text, "grant present" if "allow_gateway_injection" in text
+                else "plugins.entries.connector.allow_gateway_injection not set")
+
+    def plugin():
+        for root in (HOME / "plugins" / "connector", Path.cwd() / "connector"):
+            if (root / "plugin.yaml").is_file():
+                return True, f"found at {root}"
+        return False, "connector plugin.yaml not found under ~/.hermes/plugins/"
+
+    def gateway():
+        sock = HOME / "gateway.sock"
+        if not sock.exists():
+            return False, "gateway.sock missing — gateway not running?"
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect(str(sock))
+            s.sendall(json.dumps({"verb": "identify"}).encode() + b"\n")
+            resp = json.loads(s.recv(65536).decode())
+            return True, f"answered, pid={resp.get('result', {}).get('pid', '?')}"
+        except Exception as e:
+            return False, f"no answer: {e}"
+
+    def logw():
+        CONN.mkdir(parents=True, exist_ok=True)
+        with open(LOG, "a"):
+            pass
+        return True, "writable"
+
+    for name, fn in [("state.db session query", db_schema), ("injection permission", perm),
+                     ("connector plugin installed", plugin), ("gateway control socket", gateway),
+                     ("audit log writable", logw)]:
+        run(name, fn)
+    sys.exit(0 if ok_all else 1)
+
+
+# ---- web deck (loopback only) ----
+
+PAGE = """<!doctype html><html><head><meta charset=utf-8><title>connector deck</title>
+<style>
+body{background:#0d0d12;color:#c9c9d4;font-family:ui-monospace,monospace;margin:0;padding:1.2em}
+h1{font-size:1.1em;color:#ff6e9c;margin:0 0 .5em}
+.panel{border:1px solid #26262e;border-radius:8px;padding:.8em;margin-bottom:1em}
+h2{font-size:.85em;color:#8f8fa3;margin:.2em 0 .5em;text-transform:uppercase;letter-spacing:.08em}
+.link{display:flex;gap:.6em;align-items:center;padding:.3em 0;font-size:.9em}
+.link .id{color:#6e6e8a;width:14em}
+button{background:#1c1c24;color:#ff6e9c;border:1px solid #3a3a46;border-radius:5px;padding:.2em .7em;cursor:pointer;font-size:.8em}
+button:hover{background:#2a2a34}
+.evt{padding:.15em 0;border-bottom:1px solid #1a1a20;font-size:.82em;white-space:pre-wrap}
+.ok{color:#7ddb91}.ref{color:#ff7b72}.adm{color:#c8a6ff}
+#flow{max-height:40vh;overflow-y:auto}
+.meta{color:#5c5c70;font-size:.75em}
+/* character stage */
+#stage{display:flex;gap:2.5em;flex-wrap:wrap;min-height:9em}
+.actor{display:flex;flex-direction:column;align-items:center;width:11em}
+.face{font-size:2.6em;line-height:1;transition:transform .15s}
+.actor.speaking .face{transform:scale(1.25)}
+.aname{font-size:.72em;color:#8f8fa3;margin-top:.3em;text-align:center}
+.bubble{margin-top:.45em;background:#1c1c24;border:1px solid #3a3a46;border-radius:10px;
+ padding:.45em .6em;font-size:.72em;max-width:10.5em;min-height:2.2em;opacity:.35}
+.actor.speaking .bubble{opacity:1;border-color:#ff6e9c}
+</style></head><body>
+<h1>⇄ connector deck</h1>
+<div class=panel><h2>usage (evaluation)</h2><div id=usage>…</div></div>
+<div class=panel><h2>character stage</h2><div id=stage></div></div>
+<div class=panel><h2>links</h2><div id=links>…</div></div>
+<div class=panel><h2>live flow</h2><div id=flow>…</div></div>
+<script>
+const FACES={};
+function faceFor(name){if(!FACES[name]){const fs=['🐱','🦊','🐸','🐼','🦉','🐙','🦖','🐨','🦄','🐺'];FACES[name]=fs[Object.keys(FACES).length%fs.length]}return FACES[name]}
+function short(k){return (k||'?').split(':').pop()}
+function ensureActor(name,label){
+  let el=document.getElementById('actor-'+name);
+  if(!el){el=document.createElement('div');el.className='actor';el.id='actor-'+name;
+    el.innerHTML=`<div class=face>${faceFor(name)}</div><div class=aname>${name}<br><span style=color:#5c5c70>${label||''}</span></div><div class=bubble id=bubble-${name}>…</div>`;
+    document.getElementById('stage').appendChild(el)}
+  return el}
+async function refreshLinks(){
+  const r=await fetch('/api/state',{headers:{'Authorization':'Bearer '+TOKEN}});
+  const d=await r.json();
+  document.getElementById('links').innerHTML=d.links.map(l=>{
+    const ctl=d.control.killed_links.includes(l.id)?'killed':(d.control.paused_links.includes(l.id)?'paused':'-');
+    return `<div class=link><span class=id>${l.id}</span><span>${l.label}</span>
+      <span style=color:#6e6e8a>${l.kind}/${l.state}/${ctl}</span>
+      <button onclick=act('pause','${l.id}')>pause</button>
+      <button onclick=act('resume','${l.id}')>resume</button>
+      <button onclick=act('kill','${l.id}')>kill</button></div>`}).join('')
+    ||'<em>no links</em>';
+  const u=d.usage;
+  let uh=`accepted ${u.accepted_hops} · refused ${u.refused_hops} (last ${u.window_hours}h)`;
+  if(u.by_link&&Object.keys(u.by_link).length){uh+='<table style=font-size:.8em;margin-top:.4em>';
+    for(const [k,v] of Object.entries(u.by_link)){uh+=`<tr><td style=color:#6e6e8a>${k}</td><td>${v.kind}</td><td>${v.hops} hops</td><td>${v.refused} ref</td><td>${v.chars_relayed} chars</td><td>${v.sessions.join(', ')}</td></tr>`}
+    uh+='</table>'}
+  document.getElementById('usage').innerHTML=uh;
+}
+async function act(a,id){await fetch('/api/'+a,{method:'POST',headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'},body:JSON.stringify({link:id})});refreshLinks()}
+const TOKEN=new URLSearchParams(location.search).get('t')||'';
+const es=new EventSource('/api/stream?t='+TOKEN);
+const flow=document.getElementById('flow');let n=0;
+const speakers={};
+es.onmessage=ev=>{const e=JSON.parse(ev.data);
+  // character stage
+  if(e.kind==='hop'){
+    const from=short(e.from_key||e.from_title);
+    const to=short(e.to_key);
+    const label=(e.link_label||e.link_id||'');
+    if(e.accepted){
+      ensureActor(from,label);ensureActor(to,label);
+      const fa=document.getElementById('actor-'+from), ta=document.getElementById('actor-'+to);
+      for(const [el,txt] of [[fa,(e.text_preview||'').slice(0,110)],[ta,'…']]){
+        el.classList.add('speaking');
+        document.getElementById(el.id.replace('actor-','bubble-')).textContent=txt;
+        clearTimeout(speakers[el.id]);speakers[el.id]=setTimeout(()=>el.classList.remove('speaking'),4000);
+      }
+    }
+  }
+  // raw flow
+  const div=document.createElement('div');div.className='evt '+(e.kind==='admin'?'adm':(e.accepted?'ok':'ref'));
+  div.textContent=new Date(e.ts*1000).toLocaleTimeString()+'  '+(e.kind==='admin'?`ADMIN ${e.action} ${e.link_id}`:`${e.dir} ${short(e.from_key)}→${short(e.to_key)} ${e.accepted?'✓':'✗'} ${e.reason||''} ${e.link_kind?'['+e.link_kind+']':''} :: ${(e.text_preview||'').slice(0,140)}`);
+  flow.prepend(div);if(++n>200)flow.lastChild.remove()};
+function short(k){return (k||'?').split(':').pop()}
+refreshLinks();setInterval(refreshLinks,5000);
+</script></body></html>"""
+
+
+def cmd_serve(args):
+    token = TOKEN_FILE.read_text().strip() if TOKEN_FILE.exists() else None
+    if not token:
+        import secrets
+        CONN.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(16)
+        TOKEN_FILE.write_text(token)
+        os.chmod(TOKEN_FILE, 0o600)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _auth(self):
+            if self.headers.get("Authorization") == f"Bearer {token}":
+                return True
+            # token-in-query allowed on any path (loopback-only server)
+            return f"t={token}" in self.path
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/" or path.startswith("/?"):
+                if f"t={token}" not in self.path and not self._auth():
+                    return self._deny()
+                body = PAGE.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/state":
+                if not self._auth():
+                    return self._deny()
+                c = control()
+                data = json.dumps({"links": load_links(), "control": c,
+                                   "usage": usage_stats(hours=24)}).encode()
+                self._json(data)
+            elif path == "/api/stream":
+                if not self._auth():
+                    return self._deny()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                try:
+                    with open(LOG) as f:
+                        f.seek(0, 2)
+                        while True:
+                            line = f.readline()
+                            if line:
+                                self.wfile.write(b"data: " + line.strip().encode() + b"\n\n")
+                                self.wfile.flush()
+                            else:
+                                time.sleep(0.4)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self._deny()
+
+        def do_POST(self):
+            if not self._auth():
+                return self._deny()
+            path = self.path.split("?")[0]
+            if path in ("/api/pause", "/api/resume", "/api/kill"):
+                length = int(self.headers.get("Content-Length", 0))
+                link_id = json.loads(self.rfile.read(length)).get("link", "")
+                if path == "/api/pause":
+                    _edit_control(link_id, "paused_links", True)
+                elif path == "/api/resume":
+                    _edit_control(link_id, "paused_links", False)
+                else:
+                    _edit_control(link_id, "paused_links", True)
+                    _edit_control(link_id, "killed_links", True)
+                self._json(b'{"ok": true}')
+            else:
+                self._deny()
+
+        def _json(self, data):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _deny(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    print(f"deck: http://127.0.0.1:{args.port}/?t={token}")
+    print("(loopback only. keep the token private.)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(description="connector admin deck")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    t = sub.add_parser("tail")
+    t.add_argument("--lines", type=int, default=50)
+    u = sub.add_parser("usage")
+    u.add_argument("--hours", type=int, default=24)
+    for name in ("pause", "resume", "kill"):
+        s = sub.add_parser(name)
+        s.add_argument("link_id")
+    sv = sub.add_parser("serve")
+    sv.add_argument("--port", type=int, default=8765)
+    sub.add_parser("smoke")
+    args = p.parse_args()
+    {"status": cmd_status, "tail": cmd_tail, "usage": cmd_usage,
+     "pause": cmd_pause, "resume": cmd_resume, "kill": cmd_kill,
+     "smoke": cmd_smoke, "serve": cmd_serve}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
