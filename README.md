@@ -118,6 +118,15 @@ connector-deck tail
   the links.json schema can grow a `topology` field without migration pain.
 - **allow_auto_consult UI** — a deck button to flip the consult flag.
 
+## Known quirks
+
+- **hermes-chat / api_server sessions:** connector tools arrive deferred there
+  — agents must call them through the `tool_call` bridge rather than invoking
+  directly ("Tool 'connector_links' does not exist" = use tool_call). Normal
+  deferred-tool behavior, not a connector fault.
+- **Gateway restarts:** the gateway caches plugin code at startup — after any
+  plugin edit, restart the gateway or the old code keeps serving.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
