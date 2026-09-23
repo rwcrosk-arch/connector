@@ -294,7 +294,7 @@ def make_sessions_handler(ctx):
         link = L.get_for(me) if me else None
         return _json({
             "this_session": me or None,
-            "link": ({k: link[k] for k in ("id", "label", "state", "kind")} if link else None),
+            "link": ({k: (link.get("kind", "crew") if k == "kind" else link[k]) for k in ("id", "label", "state", "kind")} if link else None),
             "sessions": list_injectable_sessions(),
         })
 
