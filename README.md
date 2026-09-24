@@ -8,6 +8,7 @@ local api-server sessions, direct HTTP turns — no chat-platform dependency
 (works fully offline; Telegram not required).
 
 Status: working on Hermes Agent v0.21.3 (validated end-to-end 2026-09-24).
+Companion tool: [hsx](https://github.com/rwcrosk-arch/hsx) — the profile/session launcher.
 
 ## Components
 
