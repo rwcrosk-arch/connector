@@ -33,10 +33,12 @@ try:
     from . import links as L
     from . import log as LG
     from . import direct
+    from . import async_transport as AT
 except ImportError:  # direct-file import (tests, validation probe)
     import links as L
     import log as LG
     import direct
+    import async_transport as AT
 
 
 def _hermes_home() -> Path:
@@ -122,9 +124,11 @@ SEND_SCHEMA = {
         "Send a message over a connector link to a live session you are LINKED to "
         "(see connector_links). With several links, target by 'to' (link label or "
         "counterpart name) or 'index' (1-based). The connector adds the attribution "
-        "label itself; do not add labels. Rate-capped per exchange and window; "
-        "delivered=true means the hop was scheduled/dispatched, not that the "
-        "target's reply turn completed."
+        "label itself; do not add labels. Rate-capped per exchange and window. "
+        "Delivery mode: async (default, best for conversation) hands the message to "
+        "the target and returns immediately — never wait for or resend after an "
+        "async send; sync waits for the target's full reply turn (use only when you "
+        "need the reply in-hand and know the target is idle)."
     ),
     "parameters": {
         "type": "object",
@@ -132,6 +136,7 @@ SEND_SCHEMA = {
             "message": {"type": "string", "description": "The message text to relay. No attribution prefixes."},
             "to": {"type": "string", "description": "Optional link label or counterpart session short-name to target (required when you hold several links)."},
             "index": {"type": "integer", "description": "Optional 1-based link index (as listed by connector_links). Used when 'to' is absent."},
+            "mode": {"type": "string", "enum": ["async", "sync"], "description": "async (default): fire-and-forget, returns after hand-off. sync: wait for the target's complete reply turn (deadlocks if both sides send at once)."},
         },
     },
 }
@@ -224,18 +229,31 @@ def make_send_handler(ctx):
         target = L.other_side(link, me)
         content = f"{_label(link)} {message}"
         # Transport selection: local named sessions get a direct turn on the target
-        # session (synchronous reply, no routing index needed); everything else rides
-        # the gateway injector.
+        # session (no routing index needed); everything else rides the gateway
+        # injector. Mode: async (default, fire-and-forget) or sync (wait for the
+        # target's full reply — use only when the target is known idle).
+        mode = str(args.get("mode") or "async").lower()
+        if mode not in ("async", "sync"):
+            mode = "async"
         src = _session_source(target)
         if src in LOCAL_SOURCES:
-            result = direct.send_to_session_key(target, content)
-            delivered = bool(result.get("ok"))
-            reason = "" if delivered else str(result.get("error", "direct_failed"))[:120]
-            reply_preview = str(result.get("reply_preview", ""))[:300]
+            if mode == "async":
+                result = AT.send_async(target, content)
+                delivered = bool(result.get("ok"))
+                reason = "" if delivered else str(result.get("error", "async_failed"))[:120]
+                reply_preview = str(result.get("reply_preview", ""))[:300]
+                delivery_state = str(result.get("delivered", "handed-off"))
+            else:
+                result = direct.send_to_session_key(target, content)
+                delivered = bool(result.get("ok"))
+                reason = "" if delivered else str(result.get("error", "direct_failed"))[:120]
+                reply_preview = str(result.get("reply_preview", ""))[:300]
+                delivery_state = "confirmed" if delivered else "failed"
         else:
             delivered = bool(ctx.inject_message(content, role="user", session_key=target))
             reason = "" if delivered else "not_routed_by_gateway"
             reply_preview = ""
+            delivery_state = "scheduled" if delivered else "failed"
         if delivered:
             L.record_hop(link["id"])
         LG.log_hop(
@@ -248,16 +266,22 @@ def make_send_handler(ctx):
         )
         out = {
             "ok": delivered,
-            "transport": "direct" if src in LOCAL_SOURCES else "inject",
+            "transport": ("async" if (src in LOCAL_SOURCES and mode == "async")
+                          else "direct" if src in LOCAL_SOURCES else "inject"),
+            "delivery": delivery_state,
             "link_id": link["id"],
             "link_kind": link.get("kind", "crew"),
             "target": target,
             "target_name": _short(target),
             "hops_in_exchange": L._guard(link["id"])["exchange_hops"],
         }
-        if src in LOCAL_SOURCES:
+        if reply_preview:
             out["reply_preview"] = reply_preview
-        if src not in LOCAL_SOURCES:
+        if out["transport"] == "async":
+            out["note"] = ("message handed off; the target's reply turn runs in the background. "
+                           "Do not wait on it and do NOT resend — duplicates become ghost messages. "
+                           "The target will reply over the link when ready.")
+        elif out["transport"] == "inject":
             out["note"] = "accepted means scheduled for async dispatch, not that the turn completed"
         return _json(out)
 

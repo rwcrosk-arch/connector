@@ -46,8 +46,15 @@ def session_id_for(key: str) -> str | None:
     return row[0] if row else None
 
 
-def send_to_session_key(key: str, text: str, timeout: int = 300) -> dict:
-    """Start a turn in the target named session. Returns {ok, session_id, reply}."""
+def send_to_session_key(key: str, text: str, timeout: int = 90) -> dict:
+    """Start a turn in the target named session. Returns {ok, session_id, reply}.
+
+    timeout is deliberately BELOW the gateway's tool-execution limit so a slow
+    reply surfaces as OUR handled result (logged, retry guidance included)
+    instead of the executor killing the tool call. A timeout here does NOT mean
+    the message was lost: the POST hands the message to the target session and
+    its reply turn keeps running server-side. Resending blindly risks duplicates.
+    """
     sid = session_id_for(key)
     if not sid:
         return {"ok": False, "error": f"no session found for key {key!r} (say hello once via hermes-chat to create it)"}
@@ -77,7 +84,19 @@ def send_to_session_key(key: str, text: str, timeout: int = 300) -> dict:
     except urllib.error.HTTPError as e:
         return {"ok": False, "error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
     except urllib.error.URLError as e:
+        # a wrapped socket timeout means delivered-but-unconfirmed, not lost
+        if isinstance(getattr(e, "reason", None), (TimeoutError, OSError)) and \
+                not isinstance(getattr(e, "reason", None), urllib.error.URLError):
+            return {"ok": True, "session_id": sid, "delivered": "unconfirmed",
+                    "note": (f"no reply within {timeout}s — message handed to the target session, "
+                             "its reply turn may still be running. Do NOT resend blindly (duplicate risk).")}
         return {"ok": False, "error": f"connection failed: {e.reason}"}
+    except TimeoutError:
+        # response never arrived within the window, but the POST itself was made:
+        # treat as handed-off and unconfirmed, never as a failed hop.
+        return {"ok": True, "session_id": sid, "delivered": "unconfirmed",
+                "note": (f"no reply within {timeout}s — message handed to the target session; "
+                         "its reply turn may still be running. Do NOT resend blindly (duplicate risk).")}
 
 
 if __name__ == "__main__":

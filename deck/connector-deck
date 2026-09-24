@@ -275,19 +275,30 @@ button:hover{background:#2a2a34}
 .ok{color:#7ddb91}.ref{color:#ff7b72}.adm{color:#c8a6ff}
 #flow{max-height:40vh;overflow-y:auto}
 .meta{color:#5c5c70;font-size:.75em}
-/* character stage */
-#stage{display:flex;gap:2.5em;flex-wrap:wrap;min-height:9em}
-.actor{display:flex;flex-direction:column;align-items:center;width:11em}
-.face{font-size:2.6em;line-height:1;transition:transform .15s}
-.actor.speaking .face{transform:scale(1.25)}
-.aname{font-size:.72em;color:#8f8fa3;margin-top:.3em;text-align:center}
-.bubble{margin-top:.45em;background:#1c1c24;border:1px solid #3a3a46;border-radius:10px;
- padding:.45em .6em;font-size:.72em;max-width:10.5em;min-height:2.2em;opacity:.35}
-.actor.speaking .bubble{opacity:1;border-color:#ff6e9c}
+/* character stage — comic-book speech bubbles */
+#stage{display:flex;gap:2em;flex-wrap:wrap;min-height:15em;align-items:flex-start;padding:.5em .2em}
+.actor{display:flex;flex-direction:column;align-items:center;width:13em;position:relative}
+.face{font-size:3em;line-height:1;transition:transform .15s;filter:saturate(.85)}
+.actor.speaking .face{transform:scale(1.28) rotate(-4deg)}
+.aname{font-size:.72em;color:#8f8fa3;margin-top:.35em;text-align:center;line-height:1.35}
+.aname b{color:#c9c9d4}
+/* the bubble sits ABOVE the character, tail pointing down at their face */
+.bubble{position:relative;order:-1;margin-bottom:1.15em;background:#f4f2ec;color:#1a1a1e;
+ border:2px solid #1a1a1e;border-radius:14px;padding:.55em .7em;font-size:.74em;line-height:1.45;
+ max-width:11.5em;min-height:3.2em;box-shadow:2px 3px 0 #1a1a1e;opacity:.38;transition:opacity .2s}
+.actor.speaking .bubble{opacity:1}
+.bubble::after{content:"";position:absolute;bottom:-13px;left:2.2em;width:0;height:0;
+ border:9px solid transparent;border-top-color:#1a1a1e;border-right-width:4px;border-left-width:4px}
+.bubble .who{display:block;font-weight:bold;font-size:.85em;margin-bottom:.15em;color:#6b4ecb}
+.bubble .txt{display:block}
+.actor.thinking .bubble{opacity:.9;border-style:dashed}
+.actor.thinking .face{animation:wobble 1.2s infinite}
+@keyframes wobble{0%,100%{transform:rotate(-6deg)}50%{transform:rotate(6deg)}}
 </style></head><body>
 <h1>⇄ connector deck</h1>
 <div class=panel><h2>usage (evaluation)</h2><div id=usage>…</div></div>
-<div class=panel><h2>character stage</h2><div id=stage></div></div>
+<div class=panel><h2>character stage</h2><div id=stage></div>
+ <div class=meta style=margin-top:.5em>speech bubbles: solid = speaking · dashed = listening/thinking · dimmed = older message (last 5 min replay on load)</div></div>
 <div class=panel><h2>links</h2><div id=links>…</div></div>
 <div class=panel><h2>live flow</h2><div id=flow>…</div></div>
 <script>
@@ -297,9 +308,19 @@ function short(k){return (k||'?').split(':').pop()}
 function ensureActor(name,label){
   let el=document.getElementById('actor-'+name);
   if(!el){el=document.createElement('div');el.className='actor';el.id='actor-'+name;
-    el.innerHTML=`<div class=face>${faceFor(name)}</div><div class=aname>${name}<br><span style=color:#5c5c70>${label||''}</span></div><div class=bubble id=bubble-${name}>…</div>`;
+    el.innerHTML=`<div class=bubble id=bubble-${name}><span class=who>${name}</span><span class=txt>…</span></div>
+      <div class=face>${faceFor(name)}</div><div class=aname><b>${name}</b><br><span style=color:#5c5c70>${label||''}</span></div>`;
     document.getElementById('stage').appendChild(el)}
   return el}
+function setBubble(name,who,text,cls){
+  const el=ensureActor(name);
+  const b=document.getElementById('bubble-'+name);
+  b.querySelector('.who').textContent=who;
+  b.querySelector('.txt').textContent=text;
+  el.classList.remove('speaking','thinking');
+  if(cls)el.classList.add(cls);
+  clearTimeout(speakers[el.id]);
+  speakers[el.id]=setTimeout(()=>el.classList.remove('speaking','thinking'),5000)}
 async function refreshLinks(){
   const r=await fetch('/api/state',{headers:{'Authorization':'Bearer '+TOKEN}});
   const d=await r.json();
@@ -323,27 +344,40 @@ const TOKEN=new URLSearchParams(location.search).get('t')||'';
 const es=new EventSource('/api/stream?t='+TOKEN);
 const flow=document.getElementById('flow');let n=0;
 const speakers={};
-es.onmessage=ev=>{const e=JSON.parse(ev.data);
-  // character stage
-  if(e.kind==='hop'){
+// refresh persistence: replay the last 5 minutes of hops so a reload restores
+// the stage instead of going blank. Older events render dimmed (aged opacity).
+async function replayRecent(){
+  try{
+    const r=await fetch('/api/recent',{headers:{'Authorization':'Bearer '+TOKEN}});
+    const d=await r.json();
+    for(const e of d.events){renderHop(e,true)}
+  }catch(err){/* server hiccup — live stream will still work */}
+}
+function renderHop(e,replayed){
     const from=short(e.from_key||e.from_title);
     const to=short(e.to_key);
     const label=(e.link_label||e.link_id||'');
     if(e.accepted){
       ensureActor(from,label);ensureActor(to,label);
-      const fa=document.getElementById('actor-'+from), ta=document.getElementById('actor-'+to);
-      for(const [el,txt] of [[fa,(e.text_preview||'').slice(0,110)],[ta,'…']]){
-        el.classList.add('speaking');
-        document.getElementById(el.id.replace('actor-','bubble-')).textContent=txt;
-        clearTimeout(speakers[el.id]);speakers[el.id]=setTimeout(()=>el.classList.remove('speaking'),4000);
-      }
+      const ageMin=(Date.now()/1000-e.ts)/60;
+      // on replay, older bubbles stay dimmed (aged); live ones are vivid
+      setBubble(from,from,(e.text_preview||'').slice(0,140),replayed?null:'speaking');
+      setBubble(to,to,'…',replayed?null:'thinking');
     }
-  }
-  // raw flow
-  const div=document.createElement('div');div.className='evt '+(e.kind==='admin'?'adm':(e.accepted?'ok':'ref'));
-  div.textContent=new Date(e.ts*1000).toLocaleTimeString()+'  '+(e.kind==='admin'?`ADMIN ${e.action} ${e.link_id}`:`${e.dir} ${short(e.from_key)}→${short(e.to_key)} ${e.accepted?'✓':'✗'} ${e.reason||''} ${e.link_kind?'['+e.link_kind+']':''} :: ${(e.text_preview||'').slice(0,140)}`);
-  flow.prepend(div);if(++n>200)flow.lastChild.remove()};
+    // raw flow line
+    const div=document.createElement('div');div.className='evt '+(e.kind==='admin'?'adm':(e.accepted?'ok':'ref'));
+    div.textContent=new Date(e.ts*1000).toLocaleTimeString()+'  '+(e.kind==='admin'?`ADMIN ${e.action} ${e.link_id}`:`${e.dir} ${short(e.from_key)}→${short(e.to_key)} ${e.accepted?'✓':'✗'} ${e.reason||''} ${e.link_kind?'['+e.link_kind+']':''} :: ${(e.text_preview||'').slice(0,140)}`);
+    if(replayed)div.style.opacity=.65;
+    flow.prepend(div);if(++n>200)flow.lastChild.remove()}
+es.onmessage=ev=>{const e=JSON.parse(ev.data);
+  if(e.kind==='hop'){renderHop(e,false)}
+  else{
+    const div=document.createElement('div');div.className='evt adm';
+    div.textContent=new Date(e.ts*1000).toLocaleTimeString()+'  '+`ADMIN ${e.action} ${e.link_id}`;
+    flow.prepend(div);if(++n>200)flow.lastChild.remove()}
+};
 function short(k){return (k||'?').split(':').pop()}
+replayRecent().then(()=>{/* stage restored */});
 refreshLinks();setInterval(refreshLinks,5000);
 </script></body></html>"""
 
@@ -382,6 +416,14 @@ def cmd_serve(args):
                 data = json.dumps({"links": load_links(), "control": c,
                                    "usage": usage_stats(hours=24)}).encode()
                 self._json(data)
+            elif path == "/api/recent":
+                if not self._auth():
+                    return self._deny()
+                # replay window for page-load persistence: the last 5 minutes of hops,
+                # newest last, so a refresh restores the stage instead of going blank.
+                cutoff = time.time() - 300
+                recent = [e for e in read_log_tail(400) if e.get("kind") == "hop" and e.get("ts", 0) >= cutoff]
+                self._json(json.dumps({"events": recent}).encode())
             elif path == "/api/stream":
                 if not self._auth():
                     return self._deny()
