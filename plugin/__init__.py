@@ -369,7 +369,7 @@ def make_consult_handler(ctx):
         fired = None
         if question:
             fired = make_send_handler(ctx)(  # reuse the send path (guards, labels, audit)
-                {"message": question, "to": detail}, **kwargs)
+                {"message": question, "mode": "sync"}, **kwargs)
         return _json({"ok": True, "link_id": detail, "kind": "consult",
                       "ttl_minutes": ttl, "idle_minutes": idle, "send_result": fired})
 
